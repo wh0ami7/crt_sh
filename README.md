@@ -54,4 +54,4 @@ A Simple Golang tool to fetch root domains from crt.sh.
 To fetch root domains for `google.com` in quiet mode, you would run:
 
 ```bash
-./crt_sh -q google.com
+./crt_sh google.com
