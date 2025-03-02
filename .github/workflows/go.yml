@@ -27,7 +27,7 @@ jobs:
 
       - name: Build
         run: |
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o crt_sh-${{ matrix.goos }}-${{ matrix.goarch }} .
+          go build -v -o crt_sh-${{ matrix.goos }}-${{ matrix.goarch }} .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -45,11 +45,21 @@ jobs:
         with:
           path: binaries
 
+      - name: Rename Artifacts
+        run: |
+          for file in binaries/*; do
+            if [[ -f "$file" ]]; then
+              filename=$(basename "$file")
+              new_filename="crt_sh_${filename##*-}"
+              mv "$file" "binaries/$new_filename"
+            fi
+          done
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: binaries/**/*
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
-          draft: false # Ensure it is not a draft release
-          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }} #mark prerelease if tag contains -rc, -beta, or -alpha
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
