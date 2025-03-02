@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     name: Build Binaries
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest  # Use GitHub-hosted Ubuntu runner
     strategy:
       matrix:
         goos: [linux, windows, darwin]
@@ -37,7 +37,7 @@ jobs:
 
   release:
     name: Create Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest  # Use GitHub-hosted Ubuntu runner
     needs: build
     steps:
       - name: Download Artifacts
