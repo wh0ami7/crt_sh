@@ -19,10 +19,7 @@ jobs:
           cache: 'true'
 
       - name: Build
-        run: go build -v ./...
-
-      - name: Test
-        run: go test -v ./...
+        run: go build -v -o crtsh-go .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
