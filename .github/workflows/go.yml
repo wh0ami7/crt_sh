@@ -15,7 +15,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '^1.20'
+          go-version: '^1.24'
           cache: 'true'
 
       - name: Build
@@ -27,8 +27,8 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: built-app # Customize artifact name
-          path: ${{ github.workspace }}/app # Customize path to built artifact
+          name: crtsh-go # Customize artifact name
+          path: ${{ github.workspace }} # Customize path to built artifact
 
   release:
     name: Create Release
@@ -38,13 +38,13 @@ jobs:
       - name: Download Artifact
         uses: actions/download-artifact@v4
         with:
-          name: built-app # Match artifact name from build job
-          path: ${{ github.workspace }}/app # Match path from build job
+          name: crtsh-go # Match artifact name from build job
+          path: ${{ github.workspace }} # Match path from build job
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: ${{ github.workspace }}/app/**/* # Path to downloaded artifact
+          files: ${{ github.workspace }} # Path to downloaded artifact
           tag_name: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
           draft: false
