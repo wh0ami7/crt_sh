@@ -1,312 +1,435 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"math/rand"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
-	"sort"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 	bolt "go.etcd.io/bbolt"
+	"golang.org/x/sync/errgroup"
 )
 
+// Constants
 const (
-	cacheFile      = "crtsh_cache.db"
-	defaultTimeout = 30 * time.Second
-	flowTTL        = 120 * time.Second // TTL for both flows
-	concurrency    = 50                // Increased concurrency for second flow
-	maxRetries     = 3                 // Max retries for failed requests
-	retryDelay     = 5 * time.Second   // Delay between retries
+	cacheFile        = "crtsh_cache.db"
+	flowTimeout      = 120 * time.Second
+	startConcurrency = 5
+	baseRetryDelay   = 2 * time.Second
+	shardCount       = 64
 )
 
+// Cert represents a crt.sh certificate entry
 type Cert struct {
 	NameValue string `json:"name_value"`
 }
 
-// CacheEntry represents the structure stored in BoltDB
+// CacheEntry stores domain subsets with timestamps
 type CacheEntry struct {
-	Subsets map[int64][]string `json:"subsets"` // Timestamp -> Domains fetched at that time
+	Domains     []string `json:"domains"`
+	LastFetched int64    `json:"last_fetched"`
 }
 
+// Fetcher defines the interface for fetching domains
+type Fetcher interface {
+	Fetch(ctx context.Context, param, value string) ([]string, error)
+}
+
+// DomainStore defines the interface for storing domains
+type DomainStore interface {
+	Add(domain string) bool
+	ToSlice() []string
+}
+
+// Config holds shared configuration
+type Config struct {
+	Timeout        time.Duration
+	BaseRetryDelay time.Duration
+	Verbose        bool
+	Concurrency    int
+}
+
+// httpFetcher implements Fetcher for HTTP requests
+type httpFetcher struct {
+	client *http.Client
+	config *Config
+}
+
+// NewHTTPFetcher creates a new httpFetcher
+func NewHTTPFetcher(config *Config) Fetcher {
+	return &httpFetcher{
+		client: &http.Client{
+			Transport: &http.Transport{
+				MaxConnsPerHost: startConcurrency,
+				IdleConnTimeout: 90 * time.Second,
+			},
+		},
+		config: config,
+	}
+}
+
+// Fetch retrieves domains with retries until success
+func (f *httpFetcher) Fetch(ctx context.Context, param, value string) ([]string, error) {
+	url := fmt.Sprintf("https://crt.sh/?%s=%%25.%s&output=json", param, value)
+	attempt := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			attempt++
+			ctx, cancel := context.WithTimeout(ctx, f.config.Timeout)
+			defer cancel()
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
+				return nil, fmt.Errorf("request creation failed: %w", err)
+			}
+
+			resp, err := f.client.Do(req)
+			if err != nil {
+				if f.config.Verbose {
+					fmt.Fprintf(os.Stderr, "%s attempt %d failed for %s: %v\n", param, attempt, value, err)
+				}
+				time.Sleep(retryBackoff(attempt, f.config.BaseRetryDelay))
+				continue
+			}
+			defer resp.Body.Close()
+
+			switch resp.StatusCode {
+			case http.StatusOK:
+				reader := bufio.NewReader(resp.Body)
+				decoder := json.NewDecoder(reader)
+				var certs []Cert
+				if err := decoder.Decode(&certs); err != nil {
+					return nil, fmt.Errorf("decode failed: %w", err)
+				}
+				return extractDomains(certs, domain), nil
+			case http.StatusTooManyRequests:
+				delay := parseRetryAfter(resp)
+				if delay == 0 {
+					delay = retryBackoff(attempt, f.config.BaseRetryDelay)
+				}
+				f.config.Concurrency = max(f.config.Concurrency/2, 1)
+				if f.config.Verbose {
+					fmt.Fprintf(os.Stderr, "%s rate limited (429) for %s, attempt %d, concurrency now %d, waiting %v\n", param, value, attempt, f.config.Concurrency, delay)
+				}
+				time.Sleep(delay)
+			case http.StatusBadGateway:
+				delay := retryBackoff(attempt, f.config.BaseRetryDelay) * 2
+				if f.config.Verbose {
+					fmt.Fprintf(os.Stderr, "%s bad gateway (502) for %s, attempt %d, waiting %v\n", param, value, attempt, delay)
+				}
+				time.Sleep(delay)
+			default:
+				if f.config.Verbose {
+					fmt.Fprintf(os.Stderr, "%s status %d for %s, attempt %d, retrying\n", param, resp.StatusCode, value, attempt)
+				}
+				time.Sleep(retryBackoff(attempt, f.config.BaseRetryDelay))
+			}
+		}
+	}
+}
+
+// ShardedDomainStore implements DomainStore
+type ShardedDomainStore struct {
+	shards []struct {
+		sync.RWMutex
+		domains map[string]struct{}
+	}
+}
+
+// NewShardedDomainStore creates a sharded store
+func NewShardedDomainStore(shardCount int) *ShardedDomainStore {
+	shards := make([]struct {
+		sync.RWMutex
+		domains map[string]struct{}
+	}, shardCount)
+	for i := range shards {
+		shards[i].domains = make(map[string]struct{}, shardCount) // Pre-allocate
+	}
+	return &ShardedDomainStore{shards: shards}
+}
+
+// Add adds a domain, returning true if new
+func (s *ShardedDomainStore) Add(domain string) bool {
+	h := fnv.New32a()
+	h.Write([]byte(domain))
+	shardIdx := h.Sum32() % uint32(len(s.shards))
+	shard := &s.shards[shardIdx]
+	shard.Lock()
+	defer shard.Unlock()
+	if _, exists := shard.domains[domain]; exists {
+		return false
+	}
+	shard.domains[domain] = struct{}{}
+	return true
+}
+
+// ToSlice converts to a sorted slice
+func (s *ShardedDomainStore) ToSlice() []string {
+	var domains []string
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i := range s.shards {
+		wg.Add(1)
+		go func(shard struct {
+			sync.RWMutex
+			domains map[string]struct{}
+		}) {
+			defer wg.Done()
+			shard.RLock()
+			defer shard.RUnlock()
+			local := make([]string, 0, len(shard.domains))
+			for d := range shard.domains {
+				local = append(local, d)
+			}
+			mu.Lock()
+			domains = append(domains, local...)
+			mu.Unlock()
+		}(s.shards[i])
+	}
+	wg.Wait()
+	slices.Sort(domains)
+	return slices.Compact(domains)
+}
+
+// CLI variables
 var (
 	domain    string
 	verbose   bool
-	timeout   time.Duration
 	fromCache bool
+	config    = &Config{
+		Timeout:        flowTimeout,
+		BaseRetryDelay: baseRetryDelay,
+		Concurrency:    startConcurrency,
+	}
 )
 
+// rootCmd defines the CLI
 var rootCmd = &cobra.Command{
 	Use:   "crtsh",
 	Short: "Fetch subdomains from crt.sh",
-	Long: `A fast CLI tool to fetch subdomains from crt.sh certificate transparency logs
-with caching support and concurrent processing. Cache persists indefinitely, accumulates new records,
-and tracks fetch timestamps per subset of domains.`,
-	RunE: run,
+	Long:  "A tool for fetching subdomains from crt.sh with persistent caching.",
+	RunE:  run,
 }
 
 func init() {
 	rootCmd.Flags().StringVarP(&domain, "domain", "d", "", "Domain to query (required)")
 	rootCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
-	rootCmd.Flags().DurationVarP(&timeout, "timeout", "t", defaultTimeout, "API request timeout (unused in fetch flows)")
-	rootCmd.Flags().BoolVarP(&fromCache, "from-cache", "c", false, "Print data from cache only")
-
+	rootCmd.Flags().BoolVarP(&fromCache, "from-cache", "c", false, "Use cached data only")
 	if err := rootCmd.MarkFlagRequired("domain"); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintf(os.Stderr, "Failed to set required flag: %v\n", err)
 		os.Exit(1)
 	}
 }
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(cmd *cobra.Command, args []string) error {
+// run executes the main logic
+func run(_ *cobra.Command, _ []string) error {
 	domain = strings.ToLower(domain)
-
+	config.Verbose = verbose
 	if verbose {
-		fmt.Printf("Querying domain: %s (fetch TTL: %v, concurrency: %d)\n", domain, flowTTL, concurrency)
+		fmt.Printf("Querying %s (timeout: %v, initial concurrency: %d)\n", domain, config.Timeout, config.Concurrency)
 	}
 
-	// Open BoltDB
-	db, err := bolt.Open(cacheFile, 0600, &bolt.Options{Timeout: 1 * time.Second})
+	db, err := bolt.Open(cacheFile, 0600, nil)
 	if err != nil {
-		return fmt.Errorf("failed to open cache: %w", err)
+		return fmt.Errorf("database open failed: %w", err)
 	}
 	defer db.Close()
 
-	// Handle --from-cache flag
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
+	go func() {
+		<-sigChan
+		cancel()
+	}()
+
 	if fromCache {
-		cached, err := getFromCacheRaw(db, domain)
-		if err != nil {
-			return fmt.Errorf("failed to read from cache: %w", err)
-		}
-		if cached == nil || len(cached.Subsets) == 0 {
-			fmt.Println("No cached data found for", domain)
-			return nil
-		}
-		totalDomains := countDomains(cached.Subsets)
-		if verbose {
-			fmt.Printf("Retrieved %d domains from cache across %d subsets\n", totalDomains, len(cached.Subsets))
-		}
-		printDomainsWithSubsetTimestamps(cached.Subsets)
-		return nil
+		return displayCache(ctx, db)
 	}
 
-	// Check cache first (normal operation)
-	cached, err := getFromCache(db, domain)
-	if err == nil && cached != nil && len(cached.Subsets) > 0 {
-		if verbose {
-			fmt.Println("Retrieved results from cache")
-		}
-		printDomainsOnly(cached.Subsets)
-		return nil
-	}
+	return fetchAndStoreDomains(ctx, db)
+}
 
-	if verbose {
-		fmt.Println("Cache miss, fetching from crt.sh API...")
-	}
+// fetchAndStoreDomains fetches and stores domains
+func fetchAndStoreDomains(ctx context.Context, db *bolt.DB) error {
+	fetcher := NewHTTPFetcher(config)
+	store := NewShardedDomainStore(shardCount)
 
-	// Fetch from API if cache miss
-	start := time.Now()
-	domains, err := fetchDomains(domain)
+	// Load existing caches
+	rootCache, err := loadCacheBucket(db, "root_domains")
+	if err != nil {
+		return err
+	}
+	additionalCache, err := loadCacheBucket(db, "additional_domains")
 	if err != nil {
 		return err
 	}
 
-	// Update cache with final combined results
-	if err := storeInCache(db, domain, domains, start); err != nil {
-		return fmt.Errorf("failed to update cache: %w", err)
+	// Populate store with existing data
+	if rootCache != nil {
+		for _, d := range rootCache.Domains {
+			store.Add(d)
+		}
+	}
+	if additionalCache != nil {
+		for _, d := range additionalCache.Domains {
+			store.Add(d)
+		}
 	}
 
-	if verbose {
-		fmt.Printf("Fetched %d domains in %v\n", len(domains), time.Since(start))
-	}
-
-	// Print the newly fetched domains
-	printDomainsOnly(map[int64][]string{start.Unix(): domains})
-	return nil
-}
-
-func fetchDomains(domain string) ([]string, error) {
-	client := &http.Client{
-		Transport: &http.Transport{
-			MaxIdleConns:        concurrency,
-			MaxIdleConnsPerHost: concurrency,
-			IdleConnTimeout:     90 * time.Second,
-		},
-	}
-
-	// First flow: Finding root domains (CN endpoint) with 120s TTL
-	cnDomains, err := fetchWithRetry(client, "CN", domain, "Finding root domains")
+	// Fetch root domains (first flow)
+	rootDomains, err := fetcher.Fetch(ctx, "CN", domain)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("root domains fetch failed: %w", err)
 	}
-
 	if verbose {
-		fmt.Printf("Finding root domains: Fetched %d domains from CN endpoint\n", len(cnDomains))
+		fmt.Printf("Root domains: %d found\n", len(rootDomains))
 	}
 
-	// Second flow: Additional roots from the primary roots (q endpoint), concurrent with 120s TTL per query
-	domainMap := sync.Map{}
-	for _, d := range cnDomains {
-		domainMap.Store(d, struct{}{}) // Include original domains
+	// Update store and persist root domains
+	newRootCount := 0
+	for _, d := range rootDomains {
+		if store.Add(d) {
+			newRootCount++
+		}
+	}
+	if newRootCount > 0 {
+		if err := saveCacheBucket(db, "root_domains", rootDomains, time.Now()); err != nil {
+			return fmt.Errorf("root domains save failed: %w", err)
+		}
 	}
 
-	totalDomains := len(cnDomains)
-	var mu sync.Mutex
-	sem := make(chan struct{}, concurrency) // Semaphore to limit concurrency
-	var wg sync.WaitGroup
-
-	for i, d := range cnDomains {
-		wg.Add(1)
-		sem <- struct{}{} // Acquire semaphore
-		go func(index int, primaryDomain string) {
-			defer wg.Done()
-			defer func() { <-sem }() // Release semaphore
-
-			qDomains, err := fetchWithRetry(client, "q", primaryDomain, "Additional roots from the primary roots")
-			if err != nil {
-				if verbose {
-					fmt.Fprintf(os.Stderr, "Error fetching additional roots for %s: %v\n", primaryDomain, err)
-				}
-				return
-			}
-
-			newDomains := 0
-			for _, qd := range qDomains {
-				if _, exists := domainMap.LoadOrStore(qd, struct{}{}); !exists {
-					newDomains++
-				}
-			}
-
-			mu.Lock()
-			totalDomains += newDomains
-			if verbose {
-				fmt.Printf("Additional roots from the primary roots: Processed %d/%d domains, found %d new domains for %s, total unique domains: %d\n",
-					index+1, len(cnDomains), newDomains, primaryDomain, totalDomains)
-			}
-			mu.Unlock()
-		}(i, d)
-	}
-
-	wg.Wait()
-
-	// Combine all results into final list
-	finalDomains := make([]string, 0, totalDomains)
-	domainMap.Range(func(key, _ interface{}) bool {
-		finalDomains = append(finalDomains, key.(string))
-		return true
-	})
-	sort.Strings(finalDomains)
-
-	return finalDomains, nil
-}
-
-func fetchWithRetry(client *http.Client, endpoint, domain, flowName string) ([]string, error) {
-	url := fmt.Sprintf("https://crt.sh/?%s=%%25.%s&output=json", endpoint, domain)
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), flowTTL)
-		defer cancel()
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return nil, err
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "%s: Attempt %d/%d failed for %s: %v\n", flowName, attempt, maxRetries, domain, err)
-			}
-			if attempt == maxRetries {
-				return nil, fmt.Errorf("failed to fetch from crt.sh %s endpoint after %d retries: %w", endpoint, maxRetries, err)
-			}
-			time.Sleep(retryDelay)
-			continue
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode == http.StatusTooManyRequests {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "%s: Rate limited for %s, retrying after delay...\n", flowName, domain)
-			}
-			time.Sleep(retryDelay * time.Duration(attempt)) // Exponential backoff
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("%s endpoint HTTP status %d for %s", endpoint, resp.StatusCode, domain)
-		}
-
-		var certs []Cert
-		if err := json.NewDecoder(resp.Body).Decode(&certs); err != nil {
-			return nil, err
-		}
-
-		domains, err := processCerts(certs, domain)
-		if err != nil {
-			return nil, err
-		}
-		return domains, nil
-	}
-	return nil, fmt.Errorf("unexpected exit from retry loop for %s", domain)
-}
-
-func processCerts(certs []Cert, domain string) ([]string, error) {
-	domainPattern := regexp.MustCompile(`^(.+\.)*` + regexp.QuoteMeta(domain) + `$`)
-	uniqueDomains := sync.Map{}
-	sem := make(chan struct{}, concurrency)
-	var wg sync.WaitGroup
-
-	for i := range certs {
-		wg.Add(1)
+	// Second flow: parallel with sequential HTTP 200 await within workers
+	g, ctx := errgroup.WithContext(ctx)
+	sem := make(chan struct{}, config.Concurrency)
+	for i, root := range rootDomains {
 		sem <- struct{}{}
-		go func(cert Cert) {
-			defer wg.Done()
+		g.Go(func() error {
 			defer func() { <-sem }()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				domains, err := fetcher.Fetch(ctx, "q", root)
+				if err != nil {
+					if verbose {
+						fmt.Fprintf(os.Stderr, "Additional fetch failed for %s: %v\n", root, err)
+					}
+					return nil // Continue despite error
+				}
+				newCount := 0
+				for _, d := range domains {
+					if store.Add(d) {
+						newCount++
+					}
+				}
+				if verbose {
+					fmt.Printf("Additional: Processed %d/%d, added %d for %s\n", i+1, len(rootDomains), newCount, root)
+				}
+				return saveCacheBucket(db, "additional_domains", domains, time.Now())
+			}
+		})
+	}
 
-			lines := strings.Split(cert.NameValue, "\n")
-			for _, line := range lines {
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	return saveCacheBucket(db, "combined_domains", store.ToSlice(), time.Now())
+}
+
+// extractDomains extracts domains from certificates
+func extractDomains(certs []Cert, domain string) []string {
+	re := regexp.MustCompile(`^(.+\.)*` + regexp.QuoteMeta(domain) + `$`)
+	var domains []string
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, cert := range certs {
+		wg.Add(1)
+		go func(c Cert) {
+			defer wg.Done()
+			var local []string
+			for _, line := range strings.Split(c.NameValue, "\n") {
 				line = strings.TrimSpace(line)
 				if line == "" {
 					continue
 				}
-				lowerLine := strings.ToLower(line)
-				if domainPattern.MatchString(lowerLine) {
-					if strings.HasPrefix(lowerLine, "*.") {
-						lowerLine = strings.TrimPrefix(lowerLine, "*.")
-					}
-					uniqueDomains.Store(lowerLine, struct{}{})
+				lower := strings.ToLower(line)
+				if strings.HasPrefix(lower, "*.") {
+					lower = lower[2:]
+				}
+				if re.MatchString(lower) {
+					local = append(local, lower)
 				}
 			}
-		}(certs[i])
+			mu.Lock()
+			domains = append(domains, local...)
+			mu.Unlock()
+		}(cert)
 	}
 
 	wg.Wait()
-
-	var domains []string
-	uniqueDomains.Range(func(key, _ interface{}) bool {
-		domains = append(domains, key.(string))
-		return true
-	})
-	sort.Strings(domains)
-	return domains, nil
+	slices.Sort(domains)
+	return slices.Compact(domains)
 }
 
-// getFromCacheRaw retrieves raw cache data
-func getFromCacheRaw(db *bolt.DB, domain string) (*CacheEntry, error) {
+// retryBackoff calculates exponential backoff with jitter
+func retryBackoff(attempt int, base time.Duration) time.Duration {
+	delay := base * time.Duration(1<<(attempt-1))
+	jitter := time.Duration(rand.Int63n(int64(base)))
+	return delay + jitter
+}
+
+// parseRetryAfter reads the Retry-After header
+func parseRetryAfter(resp *http.Response) time.Duration {
+	if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+		if seconds, err := strconv.Atoi(retryAfter); err == nil {
+			return time.Duration(seconds) * time.Second
+		}
+		if t, err := time.Parse(time.RFC1123, retryAfter); err == nil {
+			return time.Until(t)
+		}
+	}
+	return 0
+}
+
+// max returns the maximum of two integers
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func loadCacheBucket(db *bolt.DB, bucketName string) (*CacheEntry, error) {
 	var entry CacheEntry
 	err := db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("domains"))
+		b := tx.Bucket([]byte(bucketName))
 		if b == nil {
 			return nil
 		}
@@ -317,103 +440,49 @@ func getFromCacheRaw(db *bolt.DB, domain string) (*CacheEntry, error) {
 		return json.Unmarshal(data, &entry)
 	})
 	if err != nil {
-		return nil, err
-	}
-	if entry.Subsets == nil {
-		return nil, nil
+		return nil, fmt.Errorf("load %s failed: %w", bucketName, err)
 	}
 	return &entry, nil
 }
 
-// getFromCache retrieves cached data without TTL check
-func getFromCache(db *bolt.DB, domain string) (*CacheEntry, error) {
-	var entry CacheEntry
-	err := db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("domains"))
-		if b == nil {
-			return nil
-		}
-		data := b.Get([]byte(domain))
-		if data == nil {
-			return nil
-		}
-		return json.Unmarshal(data, &entry)
-	})
-	if err != nil {
-		return nil, err
-	}
-	if entry.Subsets == nil {
-		return nil, nil
-	}
-	return &entry, nil
-}
-
-// storeInCache adds new domains as a subset with the fetch timestamp
-func storeInCache(db *bolt.DB, domain string, newDomains []string, fetchTime time.Time) error {
+func saveCacheBucket(db *bolt.DB, bucketName string, domains []string, fetchTime time.Time) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists([]byte("domains"))
+		b, err := tx.CreateBucketIfNotExists([]byte(bucketName))
 		if err != nil {
-			return err
+			return fmt.Errorf("create %s bucket failed: %w", bucketName, err)
 		}
 
-		// Get existing subsets
-		existingData := b.Get([]byte(domain))
-		var entry CacheEntry
-		if existingData != nil {
-			if err := json.Unmarshal(existingData, &entry); err != nil {
-				return err
-			}
+		entry := CacheEntry{
+			Domains:     domains,
+			LastFetched: fetchTime.Unix(),
 		}
-		if entry.Subsets == nil {
-			entry.Subsets = make(map[int64][]string)
-		}
-
-		// Add new subset if there are new domains
-		if len(newDomains) > 0 {
-			timestamp := fetchTime.Unix()
-			// Deduplicate within the new subset
-			domainMap := make(map[string]struct{})
-			for _, d := range newDomains {
-				domainMap[d] = struct{}{}
-			}
-			// Only add new domains not present in any existing subset
-			for _, existingDomains := range entry.Subsets {
-				for _, d := range existingDomains {
-					delete(domainMap, d)
-				}
-			}
-			if len(domainMap) > 0 {
-				newSubset := make([]string, 0, len(domainMap))
-				for d := range domainMap {
-					newSubset = append(newSubset, d)
-				}
-				sort.Strings(newSubset)
-				entry.Subsets[timestamp] = newSubset
-			}
-		}
-
-		// Store updated data
 		data, err := json.Marshal(entry)
 		if err != nil {
-			return err
+			return fmt.Errorf("marshal %s failed: %w", bucketName, err)
 		}
 		return b.Put([]byte(domain), data)
 	})
 }
 
-// countDomains calculates the total number of unique domains
-func countDomains(subsets map[int64][]string) int {
-	unique := make(map[string]struct{})
-	for _, domains := range subsets {
-		for _, d := range domains {
-			unique[d] = struct{}{}
-		}
+func displayCache(ctx context.Context, db *bolt.DB) error {
+	combined, err := loadCacheBucket(db, "combined_domains")
+	if err != nil {
+		return err
 	}
-	return len(unique)
+	if combined == nil || len(combined.Domains) == 0 {
+		fmt.Println("No cached data for", domain)
+		return nil
+	}
+	if verbose {
+		fmt.Printf("Found %d domains in cache\n", len(combined.Domains))
+	}
+	for _, d := range combined.Domains {
+		fmt.Println(d)
+	}
+	return nil
 }
 
-// printDomainsOnly prints just the domain names from all subsets
-func printDomainsOnly(subsets map[int64][]string) {
+func printDomains(subsets map[int64][]string) {
 	unique := make(map[string]struct{})
 	for _, domains := range subsets {
 		for _, d := range domains {
@@ -424,27 +493,25 @@ func printDomainsOnly(subsets map[int64][]string) {
 	for d := range unique {
 		sorted = append(sorted, d)
 	}
-	sort.Strings(sorted)
+	slices.Sort(sorted)
 	for _, d := range sorted {
 		fmt.Println(d)
 	}
 }
 
-// printDomainsWithSubsetTimestamps prints domains grouped by fetch timestamp, newest first
-func printDomainsWithSubsetTimestamps(subsets map[int64][]string) {
+func printDomainsWithTimestamps(subsets map[int64][]string) {
 	type subset struct {
 		Timestamp int64
 		Domains   []string
 	}
-	sortedSubsets := make([]subset, 0, len(subsets))
+	sorted := make([]subset, 0, len(subsets))
 	for ts, domains := range subsets {
-		sortedSubsets = append(sortedSubsets, subset{Timestamp: ts, Domains: domains})
+		sorted = append(sorted, subset{Timestamp: ts, Domains: domains})
 	}
-	sort.Slice(sortedSubsets, func(i, j int) bool {
-		return sortedSubsets[i].Timestamp > sortedSubsets[j].Timestamp // Descending order
+	slices.SortFunc(sorted, func(a, b subset) int {
+		return int(b.Timestamp - a.Timestamp)
 	})
-
-	for _, s := range sortedSubsets {
+	for _, s := range sorted {
 		fmt.Printf("Fetched at %s:\n", time.Unix(s.Timestamp, 0).Format(time.RFC3339))
 		for _, d := range s.Domains {
 			fmt.Printf("  %s\n", d)
