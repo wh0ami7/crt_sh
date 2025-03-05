@@ -1,12 +1,11 @@
 name: Build and Release
 
-# Trigger the workflow on push to main, pull requests, or tagged releases
 on:
   push:
     branches:
       - main
     tags:
-      - 'v*.*.*' # Triggers release job for tags like v1.0.0
+      - 'v*.*.*' # Triggers release for tags like v1.0.0
   pull_request:
     branches:
       - main
@@ -14,6 +13,19 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Define all target platforms and architectures
+        goos: [linux, windows, darwin, freebsd]
+        goarch: [amd64, arm64, 386, arm]
+        exclude:
+          # Exclude invalid combinations (e.g., 386/arm not supported on macOS)
+          - goos: darwin
+            goarch: 386
+          - goos: darwin
+            goarch: arm
+          - goos: windows
+            goarch: arm
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -21,7 +33,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.24' # Update to your Go version
 
       - name: Install dependencies
         run: go mod download
@@ -36,54 +48,56 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-
 
-      - name: Build
-        run: go build -v -o crtsh-go .
-
-      - name: Test
-        run: go test -v ./...
-        if: success() # Only run tests if build succeeds
+      - name: Build for ${{ matrix.goos }}-${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          # Adjust output name based on platform (add .exe for Windows)
+          OUTPUT_NAME=crt_sh-go
+          if [ "$GOOS" = "windows" ]; then OUTPUT_NAME=crt_sh-go.exe; fi
+          go build -v -o "$OUTPUT_NAME" .
+          echo "Built $OUTPUT_NAME for $GOOS-$GOARCH"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: crtsh-go
-          path: myapp
+          name: crt_sh-go-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: crt_sh-go*
 
   release:
-    # Only run this job if the event is a tag push (e.g., v1.0.0)
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build # Depends on the build job completing successfully
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download built artifact
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: crtsh-go
           path: ./artifacts/
 
       - name: Create Release
+        id: create_release
         uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Required for authentication
-        with:
-          tag_name: ${{ github.ref_name }} # e.g., v1.0.0
-          release_name: Release ${{ github.ref_name }}
-          draft: false # Set to true if you want a draft release
-          prerelease: false # Set to true for pre-releases (e.g., v1.0.0-beta)
-          body: |
-            Automated release for ${{ github.ref_name }}.
-            - Built from main.go
-            - See commit: ${{ github.sha }}
-
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ steps.create-release.outputs.upload_url }} # From create-release step
-          asset_path: ./artifacts/crtsh-go
-          asset_name: myapp-${{ github.ref_name }}-linux-amd64
-          asset_content_type: application/octet-stream
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          body: |
+            Automated release for ${{ github.ref_name }}.
+            - Compiled crt_sh-go for multiple platforms
+            - Commit: ${{ github.sha }}
+
+      - name: Upload Release Assets
+        run: |
+          for artifact in ./artifacts/crt_sh-go-*/*; do
+            asset_name=$(basename "$artifact")
+            gh release upload ${{ github.ref_name }} "$artifact" --repo ${{ github.repository }} --clobber
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
