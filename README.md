@@ -12,6 +12,8 @@
 [![Pull Requests](https://img.shields.io/github/issues-pr/wh0ami7/crt_sh)](https://github.com/wh0ami7/crt_sh/pulls)
 [![Forks](https://img.shields.io/github/forks/wh0ami7/crt_sh)](https://github.com/wh0ami7/crt_sh/network/members)
 [![Stars](https://img.shields.io/github/stars/wh0ami7/crt_sh)](https://github.com/wh0ami7/crt_sh/stargazers)
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/wh0ami7/crt_sh/total)
+
 
 A Simple Golang tool to fetch root domains from crt.sh.
 
