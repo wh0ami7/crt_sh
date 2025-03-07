@@ -27,17 +27,17 @@ A Simple Golang tool to fetch root domains from crt.sh.
 Retrieve certificates for example.com:
 
 ```bash
-    crt_sh -d example.com
+crt_sh -d example.com
 ```
 
 2. Verbose Mode
 Query example.com with detailed output:
 
 ```bash
-    crt_sh -d example.com -v
+crt_sh -d example.com -v
 ```
 3. Retrive domains from previously completed scans:
 
 ```bash
-    crt_sh -d example.com -c
+crt_sh -d example.com -c
 ```
